@@ -2,18 +2,16 @@ mod import_analysis;
 
 use crate::import_analysis::{ImportAnalysis, ImportSpecification};
 use std::rc::Rc;
-use swc_core::atoms::{atom, Atom};
+use swc_core::atoms::Atom;
 use swc_core::common::util::take::Take;
-use swc_core::ecma::ast::{
-    ArrayLit, ArrayPat, BindingIdent, CallExpr, Callee, ClassDecl, Decl, Expr, ExprOrSpread,
-    Function, Ident, Pat, Stmt, VarDecl, VarDeclKind, VarDeclarator,
-};
+use swc_core::ecma::ast::{ClassDecl, FnDecl, Function, Ident, VarDecl, VarDeclarator};
 use swc_core::ecma::visit::{VisitMutWith, VisitWith};
 use swc_core::ecma::{
     ast::Program,
     visit::{as_folder, FoldWith, VisitMut},
 };
 use swc_core::plugin::{plugin_transform, proxies::TransformPluginProgramMetadata};
+use swc_core::quote;
 
 struct ActiveReplacement {
     import: Rc<ImportSpecification>,
@@ -29,17 +27,38 @@ pub struct TransformVisitor {
 }
 
 impl VisitMut for TransformVisitor {
-    fn visit_mut_program(&mut self, node: &mut Program) {
-        let mut import_analysis = ImportAnalysis::new();
-        node.visit_with(&mut import_analysis);
-        let imports = import_analysis.into_import_specifications();
-        self.imports = imports.into_iter().map(Rc::new).collect();
-        node.visit_mut_children_with(self);
-    }
-
     fn visit_mut_class_decl(&mut self, node: &mut ClassDecl) {
         self.current_scope_symbol = Some(node.ident.sym.clone());
         node.visit_mut_children_with(self);
+        self.current_scope_symbol = None;
+    }
+
+    fn visit_mut_fn_decl(&mut self, node: &mut FnDecl) {
+        if self.current_scope_symbol.is_none() {
+            self.current_scope_symbol = Some(node.ident.sym.clone());
+            node.visit_mut_children_with(self);
+            self.current_scope_symbol = None;
+        } else {
+            node.visit_mut_children_with(self);
+        }
+    }
+
+    fn visit_mut_var_declarator(&mut self, node: &mut VarDeclarator) {
+        let Some(init) = &mut node.init else {
+            return node.visit_mut_children_with(self);
+        };
+        let Some(ident) = node.name.as_ident() else {
+            return node.visit_mut_children_with(self);
+        };
+        let Some(arrow) = init.as_mut_arrow() else {
+            return node.visit_mut_children_with(self);
+        };
+        if self.current_scope_symbol.is_some() {
+            return node.visit_mut_children_with(self);
+        }
+
+        self.current_scope_symbol = Some(ident.sym.clone());
+        arrow.visit_mut_children_with(self);
         self.current_scope_symbol = None;
     }
 
@@ -55,55 +74,12 @@ impl VisitMut for TransformVisitor {
         let active_replacements = self.active_replacements.take();
         let mut new_statements = vec![];
         for replacement in active_replacements {
-            new_statements.push(Stmt::Decl(Decl::Var(Box::new(VarDecl {
-                span: Default::default(),
-                ctxt: Default::default(),
-                kind: VarDeclKind::Const,
-                declare: false,
-                decls: vec![VarDeclarator {
-                    span: Default::default(),
-                    name: Pat::Array(ArrayPat {
-                        span: Default::default(),
-                        elems: vec![Some(Pat::Ident(BindingIdent::from(Ident {
-                            span: Default::default(),
-                            ctxt: Default::default(),
-                            sym: replacement.symbol,
-                            optional: false,
-                        })))],
-                        optional: false,
-                        type_ann: None,
-                    }),
-                    init: Some(Box::new(Expr::Call(CallExpr {
-                        span: Default::default(),
-                        ctxt: Default::default(),
-                        callee: Callee::Expr(Box::new(Expr::Ident(Ident {
-                            span: Default::default(),
-                            ctxt: Default::default(),
-                            sym: atom!("_di"),
-                            optional: false,
-                        }))),
-                        args: vec![
-                            ExprOrSpread::from(Expr::Array(ArrayLit {
-                                span: Default::default(),
-                                elems: vec![Some(ExprOrSpread::from(Expr::Ident(Ident {
-                                    span: Default::default(),
-                                    ctxt: Default::default(),
-                                    sym: replacement.import.local_imported_symbol.clone(),
-                                    optional: false,
-                                })))],
-                            })),
-                            ExprOrSpread::from(Expr::Ident(Ident {
-                                span: Default::default(),
-                                ctxt: Default::default(),
-                                sym: current_scope_symbol.clone(),
-                                optional: false,
-                            })),
-                        ],
-                        type_args: None,
-                    }))),
-                    definite: false,
-                }],
-            }))));
+            new_statements.push(quote!(
+                "const [$binding] = _di([$local_sym], $scope)" as Stmt,
+                binding = replacement.symbol.into(),
+                local_sym = replacement.import.local_imported_symbol.clone().into(),
+                scope = current_scope_symbol.clone().into()
+            ));
         }
 
         body.stmts = new_statements
@@ -129,6 +105,14 @@ impl VisitMut for TransformVisitor {
             symbol: new_symbol,
             import: import.clone(),
         });
+    }
+
+    fn visit_mut_program(&mut self, node: &mut Program) {
+        let mut import_analysis = ImportAnalysis::new();
+        node.visit_with(&mut import_analysis);
+        let imports = import_analysis.into_import_specifications();
+        self.imports = imports.into_iter().map(Rc::new).collect();
+        node.visit_mut_children_with(self);
     }
 }
 
@@ -191,6 +175,62 @@ class MyComponent extends Component {
         const [_Modal] = _di([Modal], MyComponent);
         return <_Modal />;
     }
+}"#,
+        );
+    }
+
+    #[test]
+    fn test_should_work_in_function_components() {
+        test_inline_input_output(
+            Syntax::Es(EsSyntax {
+                jsx: true,
+                ..Default::default()
+            }),
+            |_| as_folder(TransformVisitor::default()),
+            // Input codes
+            r#"
+import React, { Component } from 'react';
+import Modal from 'modal';
+
+function MyComponent() {
+    return <Modal />;
+}"#,
+            // Output codes after transformed with plugin
+            r#"
+import React, { Component } from 'react';
+import Modal from 'modal';
+
+function MyComponent() {
+    const [_Modal] = _di([Modal], MyComponent);
+    return <_Modal />;
+}"#,
+        );
+    }
+
+    #[test]
+    fn test_should_work_in_arrow_function_components() {
+        test_inline_input_output(
+            Syntax::Es(EsSyntax {
+                jsx: true,
+                ..Default::default()
+            }),
+            |_| as_folder(TransformVisitor::default()),
+            // Input codes
+            r#"
+import React, { Component } from 'react';
+import Modal from 'modal';
+
+const MyComponent = () => {
+    return <Modal />;
+}"#,
+            // Output codes after transformed with plugin
+            r#"
+import React, { Component } from 'react';
+import Modal from 'modal';
+
+const MyComponent = () => {
+    const [_Modal] = _di([Modal], MyComponent);
+    return <_Modal />;
 }"#,
         );
     }

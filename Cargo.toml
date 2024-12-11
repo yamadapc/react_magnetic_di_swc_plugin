@@ -11,7 +11,7 @@ lto = true
 
 [dependencies]
 serde = "1"
-swc_core = { version = "0.101.*", features = ["ecma_plugin_transform", "swc_ecma_parser", "ecma_ast"] }
+swc_core = { version = "0.101.*", features = ["ecma_plugin_transform", "swc_ecma_parser", "ecma_ast", "ecma_quote"] }
 swc_ecma_parser = "*"
 
 # .cargo/config defines few alias to build plugin.
